@@ -1,0 +1,3280 @@
+
+//http.js***************************
+//http.js***************************
+//http.js***************************
+//http.js***************************
+//http.js***************************
+
+
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+var util = require('util');
+var EventEmitter = require('events').EventEmitter;
+
+
+exports.IncomingMessage = require('_http_incoming').IncomingMessage;
+
+
+var common = require('_http_common');
+exports.METHODS = util._extend([], common.methods).sort();
+
+
+exports.OutgoingMessage = require('_http_outgoing').OutgoingMessage;
+
+
+var server = require('_http_server');//2.server是require进来的一个'_http_server'私有模块，返回主目录查看私有模块'_http_server'，进入模块中常看Server()
+exports.ServerResponse = server.ServerResponse;
+exports.STATUS_CODES = server.STATUS_CODES;
+
+
+var agent = require('_http_agent');
+var Agent = exports.Agent = agent.Agent;
+exports.globalAgent = agent.globalAgent;
+
+var client = require('_http_client');
+var ClientRequest = exports.ClientRequest = client.ClientRequest;
+
+exports.request = function(options, cb) {
+  return new ClientRequest(options, cb);
+};
+
+exports.get = function(options, cb) {
+  var req = exports.request(options, cb);
+  req.end();
+  return req;
+};
+
+exports._connectionListener = server._connectionListener;
+var Server = exports.Server = server.Server;
+
+exports.createServer = function(requestListener) {
+  return new Server(requestListener);//1.返回的是Server对象实例
+};
+
+
+// Legacy Interface
+
+function Client(port, host) {
+  if (!(this instanceof Client)) return new Client(port, host);
+  EventEmitter.call(this);
+
+  host = host || 'localhost';
+  port = port || 80;
+  this.host = host;
+  this.port = port;
+  this.agent = new Agent({ host: host, port: port, maxSockets: 1 });
+}
+util.inherits(Client, EventEmitter);
+Client.prototype.request = function(method, path, headers) {
+  var self = this;
+  var options = {};
+  options.host = self.host;
+  options.port = self.port;
+  if (method[0] === '/') {
+    headers = path;
+    path = method;
+    method = 'GET';
+  }
+  options.method = method;
+  options.path = path;
+  options.headers = headers;
+  options.agent = self.agent;
+  var c = new ClientRequest(options);
+  c.on('error', function(e) {
+    self.emit('error', e);
+  });
+  // The old Client interface emitted 'end' on socket end.
+  // This doesn't map to how we want things to operate in the future
+  // but it will get removed when we remove this legacy interface.
+  c.on('socket', function(s) {
+    s.on('end', function() {
+      if (self._decoder) {
+        var ret = self._decoder.end();
+        if (ret)
+          self.emit('data', ret);
+      }
+      self.emit('end');
+    });
+  });
+  return c;
+};
+
+exports.Client = util.deprecate(Client,
+    'http.Client will be removed soon. Do not use it.');
+
+exports.createClient = util.deprecate(function(port, host) {
+  return new Client(port, host);
+}, 'http.createClient is deprecated. Use `http.request` instead.');
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// _http_server.js*****************************
+// _http_server.js*****************************
+// _http_server.js*****************************
+// _http_server.js*****************************
+// _http_server.js*****************************
+
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+var util = require('util');
+var net = require('net');
+var EventEmitter = require('events').EventEmitter;
+var HTTPParser = process.binding('http_parser').HTTPParser;
+var assert = require('assert').ok;
+
+var common = require('_http_common');
+var parsers = common.parsers;//17.parsers是由http.js模块中common.parser生成的。下面到_http_common.js看看common模块
+var freeParser = common.freeParser;
+var debug = common.debug;
+var CRLF = common.CRLF;
+var continueExpression = common.continueExpression;
+var chunkExpression = common.chunkExpression;
+var httpSocketSetup = common.httpSocketSetup;
+
+var OutgoingMessage = require('_http_outgoing').OutgoingMessage;//10.OutgoingMessage来自私有模块_http_outgoing。下面到_http_outgoing.js模块中查看OutgoingMessage
+
+
+var STATUS_CODES = exports.STATUS_CODES = {
+  100 : 'Continue',
+  101 : 'Switching Protocols',
+  102 : 'Processing',                 // RFC 2518, obsoleted by RFC 4918
+  200 : 'OK',
+  201 : 'Created',
+  202 : 'Accepted',
+  203 : 'Non-Authoritative Information',
+  204 : 'No Content',
+  205 : 'Reset Content',
+  206 : 'Partial Content',
+  207 : 'Multi-Status',               // RFC 4918
+  300 : 'Multiple Choices',
+  301 : 'Moved Permanently',
+  302 : 'Moved Temporarily',
+  303 : 'See Other',
+  304 : 'Not Modified',
+  305 : 'Use Proxy',
+  307 : 'Temporary Redirect',
+  308 : 'Permanent Redirect',         // RFC 7238
+  400 : 'Bad Request',
+  401 : 'Unauthorized',
+  402 : 'Payment Required',
+  403 : 'Forbidden',
+  404 : 'Not Found',
+  405 : 'Method Not Allowed',
+  406 : 'Not Acceptable',
+  407 : 'Proxy Authentication Required',
+  408 : 'Request Time-out',
+  409 : 'Conflict',
+  410 : 'Gone',
+  411 : 'Length Required',
+  412 : 'Precondition Failed',
+  413 : 'Request Entity Too Large',
+  414 : 'Request-URI Too Large',
+  415 : 'Unsupported Media Type',
+  416 : 'Requested Range Not Satisfiable',
+  417 : 'Expectation Failed',
+  418 : 'I\'m a teapot',              // RFC 2324
+  422 : 'Unprocessable Entity',       // RFC 4918
+  423 : 'Locked',                     // RFC 4918
+  424 : 'Failed Dependency',          // RFC 4918
+  425 : 'Unordered Collection',       // RFC 4918
+  426 : 'Upgrade Required',           // RFC 2817
+  428 : 'Precondition Required',      // RFC 6585
+  429 : 'Too Many Requests',          // RFC 6585
+  431 : 'Request Header Fields Too Large',// RFC 6585
+  500 : 'Internal Server Error',
+  501 : 'Not Implemented',
+  502 : 'Bad Gateway',
+  503 : 'Service Unavailable',
+  504 : 'Gateway Time-out',
+  505 : 'HTTP Version Not Supported',
+  506 : 'Variant Also Negotiates',    // RFC 2295
+  507 : 'Insufficient Storage',       // RFC 4918
+  509 : 'Bandwidth Limit Exceeded',
+  510 : 'Not Extended',               // RFC 2774
+  511 : 'Network Authentication Required' // RFC 6585
+};
+
+//7.ServerResponse是一个构造函数
+function ServerResponse(req) {
+  OutgoingMessage.call(this);
+
+  if (req.method === 'HEAD') this._hasBody = false;
+
+  this.sendDate = true;
+
+  if (req.httpVersionMajor < 1 || req.httpVersionMinor < 1) {
+    this.useChunkedEncodingByDefault = chunkExpression.test(req.headers.te);
+    this.shouldKeepAlive = false;
+  }
+}
+util.inherits(ServerResponse, OutgoingMessage);//8.继承自OutgoingMessage，ServerResponse其实是OutgoingMessage的一个子类
+
+ServerResponse.prototype._finish = function() {
+  DTRACE_HTTP_SERVER_RESPONSE(this.connection);
+  COUNTER_HTTP_SERVER_RESPONSE();
+  OutgoingMessage.prototype._finish.call(this);
+};
+
+
+
+exports.ServerResponse = ServerResponse;//9.在_http_server私有模块中将ServerResponse暴露出去。下面看看OutgoingMessage
+
+ServerResponse.prototype.statusCode = 200;
+ServerResponse.prototype.statusMessage = undefined;
+
+function onServerResponseClose() {
+  // EventEmitter.emit makes a copy of the 'close' listeners array before
+  // calling the listeners. detachSocket() unregisters onServerResponseClose
+  // but if detachSocket() is called, directly or indirectly, by a 'close'
+  // listener, onServerResponseClose is still in that copy of the listeners
+  // array. That is, in the example below, b still gets called even though
+  // it's been removed by a:
+  //
+  //   var obj = new events.EventEmitter;
+  //   obj.on('event', a);
+  //   obj.on('event', b);
+  //   function a() { obj.removeListener('event', b) }
+  //   function b() { throw "BAM!" }
+  //   obj.emit('event');  // throws
+  //
+  // Ergo, we need to deal with stale 'close' events and handle the case
+  // where the ServerResponse object has already been deconstructed.
+  // Fortunately, that requires only a single if check. :-)
+  if (this._httpMessage) this._httpMessage.emit('close');
+}
+
+ServerResponse.prototype.assignSocket = function(socket) {
+  assert(!socket._httpMessage);
+  socket._httpMessage = this;
+  socket.on('close', onServerResponseClose);
+  this.socket = socket;
+  this.connection = socket;
+  this.emit('socket', socket);
+  this._flush();
+};
+
+ServerResponse.prototype.detachSocket = function(socket) {
+  assert(socket._httpMessage === this);
+  socket.removeListener('close', onServerResponseClose);
+  socket._httpMessage = null;
+  this.socket = this.connection = null;
+};
+
+ServerResponse.prototype.writeContinue = function(cb) {
+  this._writeRaw('HTTP/1.1 100 Continue' + CRLF + CRLF, 'ascii', cb);
+  this._sent100 = true;
+};
+
+ServerResponse.prototype._implicitHeader = function() {
+  this.writeHead(this.statusCode);
+};
+
+ServerResponse.prototype.writeHead = function(statusCode, reason, obj) {
+  var headers;
+
+  if (util.isString(reason)) {
+    // writeHead(statusCode, reasonPhrase[, headers])
+    this.statusMessage = reason;
+  } else {
+    // writeHead(statusCode[, headers])
+    this.statusMessage =
+        this.statusMessage || STATUS_CODES[statusCode] || 'unknown';
+    obj = reason;
+  }
+  this.statusCode = statusCode;
+
+  if (this._headers) {
+    // Slow-case: when progressive API and header fields are passed.
+    if (obj) {
+      var keys = Object.keys(obj);
+      for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (k) this.setHeader(k, obj[k]);
+      }
+    }
+    // only progressive api is used
+    headers = this._renderHeaders();
+  } else {
+    // only writeHead() called
+    headers = obj;
+  }
+
+  statusCode |= 0;
+  if (statusCode < 100 || statusCode > 999)
+    throw new RangeError('Invalid status code: ' + statusCode);
+
+  if (common._checkInvalidHeaderChar(this.statusMessage))
+    throw new Error('Invalid character in statusMessage.');
+
+  var statusLine = 'HTTP/1.1 ' + statusCode.toString() + ' ' +
+                   this.statusMessage + CRLF;
+
+  if (statusCode === 204 || statusCode === 304 ||
+      (100 <= statusCode && statusCode <= 199)) {
+    // RFC 2616, 10.2.5:
+    // The 204 response MUST NOT include a message-body, and thus is always
+    // terminated by the first empty line after the header fields.
+    // RFC 2616, 10.3.5:
+    // The 304 response MUST NOT contain a message-body, and thus is always
+    // terminated by the first empty line after the header fields.
+    // RFC 2616, 10.1 Informational 1xx:
+    // This class of status code indicates a provisional response,
+    // consisting only of the Status-Line and optional headers, and is
+    // terminated by an empty line.
+    this._hasBody = false;
+  }
+
+  // don't keep alive connections where the client expects 100 Continue
+  // but we sent a final status; they may put extra bytes on the wire.
+  if (this._expect_continue && !this._sent100) {
+    this.shouldKeepAlive = false;
+  }
+
+  this._storeHeader(statusLine, headers);
+};
+
+ServerResponse.prototype.writeHeader = function() {
+  this.writeHead.apply(this, arguments);
+};
+
+//3.查看Server(方法)
+function Server(requestListener) {
+  if (!(this instanceof Server)) return new Server(requestListener);
+  net.Server.call(this, { allowHalfOpen: true });//23.在Server中，net.Server.call()将this指针指向到了当前实例。下面到net.js中看看connection事件
+
+//4.如果回调方法requestListener存在，就会在当前实例上添加一个事件监听addListener，来监听request，如果有request事件触发的时候就会调用回调函数requestListener。下面分析request事件是怎么被触发的（如果request是在本文件中可以直接查找request单词）
+  if (requestListener) {
+    this.addListener('request', requestListener);
+  }
+
+  // Similar option to this. Too lazy to write my own docs.
+  // http://www.squid-cache.org/Doc/config/half_closed_clients/
+  // http://wiki.squid-cache.org/SquidFaq/InnerWorkings#What_is_a_half-closed_filedescriptor.3F
+  this.httpAllowHalfOpen = false;
+
+  this.addListener('connection', connectionListener);//22.connectionListener是在connection事件被触发时调用。那么connection事件是什么时候被触发的呢？
+
+  this.addListener('clientError', function(err, conn) {
+    conn.destroy(err);
+  });
+
+  this.timeout = 2 * 60 * 1000;
+}
+util.inherits(Server, net.Server);
+
+
+Server.prototype.setTimeout = function(msecs, callback) {
+  this.timeout = msecs;
+  if (callback)
+    this.on('timeout', callback);
+};
+
+
+exports.Server = Server;
+
+//21.parserOnIncoming是在connectionListener中定义的
+function connectionListener(socket) {
+  var self = this;
+  var outgoing = [];
+  var incoming = [];
+
+  function abortIncoming() {
+    while (incoming.length) {
+      var req = incoming.shift();
+      req.emit('aborted');
+      req.emit('close');
+    }
+    // abort socket._httpMessage ?
+  }
+
+  function serverSocketCloseListener() {
+    debug('server socket close');
+    // mark this parser as reusable
+    if (this.parser) {
+      freeParser(this.parser, null, this);
+    }
+
+    abortIncoming();
+  }
+
+  debug('SERVER new http connection');
+
+  httpSocketSetup(socket);
+
+  // If the user has added a listener to the server,
+  // request, or response, then it's their responsibility.
+  // otherwise, destroy on timeout by default
+  if (self.timeout)
+    socket.setTimeout(self.timeout);
+  socket.on('timeout', function() {
+    var req = socket.parser && socket.parser.incoming;
+    var reqTimeout = req && !req.complete && req.emit('timeout', socket);
+    var res = socket._httpMessage;
+    var resTimeout = res && res.emit('timeout', socket);
+    var serverTimeout = self.emit('timeout', socket);
+
+    if (!reqTimeout && !resTimeout && !serverTimeout)
+      socket.destroy();
+  });
+
+  var parser = parsers.alloc();//16.parser是由parsers.alloc()生成的，废话。下面看看parsers
+  parser.reinitialize(HTTPParser.REQUEST);
+  parser.socket = socket;
+  socket.parser = parser;
+  parser.incoming = null;
+
+  // Propagate headers limit from server instance to parser
+  if (util.isNumber(this.maxHeadersCount)) {
+    parser.maxHeaderPairs = this.maxHeadersCount << 1;
+  } else {
+    // Set default value because parser may be reused from FreeList
+    parser.maxHeaderPairs = 2000;
+  }
+
+  socket.addListener('error', socketOnError);
+  socket.addListener('close', serverSocketCloseListener);
+  parser.onIncoming = parserOnIncoming;//15.parserOnIncoming杯赋值给parser.onIncoming。下面看看parser
+  socket.on('end', socketOnEnd);
+  socket.on('data', socketOnData);
+
+  // TODO(isaacs): Move all these functions out of here
+  function socketOnError(e) {
+    self.emit('clientError', e, this);
+  }
+
+  function socketOnData(d) {
+    assert(!socket._paused);
+    debug('SERVER socketOnData %d', d.length);
+    var ret = parser.execute(d);
+    if (ret instanceof Error) {
+      debug('parse error');
+      socket.destroy(ret);
+    } else if (parser.incoming && parser.incoming.upgrade) {
+      // Upgrade or CONNECT
+      var bytesParsed = ret;
+      var req = parser.incoming;
+      debug('SERVER upgrade or connect', req.method);
+
+      socket.removeListener('data', socketOnData);
+      socket.removeListener('end', socketOnEnd);
+      socket.removeListener('close', serverSocketCloseListener);
+      parser.finish();
+      freeParser(parser, req, null);
+      parser = null;
+
+      var eventName = req.method === 'CONNECT' ? 'connect' : 'upgrade';
+      if (EventEmitter.listenerCount(self, eventName) > 0) {
+        debug('SERVER have listener for %s', eventName);
+        var bodyHead = d.slice(bytesParsed, d.length);
+
+        // TODO(isaacs): Need a way to reset a stream to fresh state
+        // IE, not flowing, and not explicitly paused.
+        socket._readableState.flowing = null;
+        self.emit(eventName, req, socket, bodyHead);
+      } else {
+        // Got upgrade header or CONNECT method, but have no handler.
+        socket.destroy();
+      }
+    }
+
+    if (socket._paused && socket.parser) {
+      // onIncoming paused the socket, we should pause the parser as well
+      debug('pause parser');
+      socket.parser.pause();
+    }
+  }
+
+  function socketOnEnd() {
+    var socket = this;
+    var ret = parser.finish();
+
+    if (ret instanceof Error) {
+      debug('parse error');
+      socket.destroy(ret);
+      return;
+    }
+
+    if (!self.httpAllowHalfOpen) {
+      abortIncoming();
+      if (socket.writable) socket.end();
+    } else if (outgoing.length) {
+      outgoing[outgoing.length - 1]._last = true;
+    } else if (socket._httpMessage) {
+      socket._httpMessage._last = true;
+    } else {
+      if (socket.writable) socket.end();
+    }
+  }
+
+
+  // The following callback is issued after the headers have been read on a
+  // new message. In this callback we setup the response object and pass it
+  // to the user.
+
+  socket._paused = false;
+  function socketOnDrain() {
+    // If we previously paused, then start reading again.
+    if (socket._paused) {
+      socket._paused = false;
+      if (socket.parser)
+        socket.parser.resume();
+      socket.resume();
+    }
+  }
+  socket.on('drain', socketOnDrain);
+//14.req并不是在parserOnIncoming中生成的，而是传入的一个参数，下面看看parserOnIncoming方法是在哪里被调用的，是用什么作为第一个参数传入进来
+  function parserOnIncoming(req, shouldKeepAlive) {
+    incoming.push(req);
+
+    // If the writable end isn't consuming, then stop reading
+    // so that we don't become overwhelmed by a flood of
+    // pipelined requests that may never be resolved.
+    if (!socket._paused) {
+      var needPause = socket._writableState.needDrain;
+      if (needPause) {
+        socket._paused = true;
+        // We also need to pause the parser, but don't do that until after
+        // the call to execute, because we may still be processing the last
+        // chunk.
+        socket.pause();
+      }
+    }
+
+    var res = new ServerResponse(req);//6.在这里声明了一个变量res，他是ServerResponse的实例，对ServerResponse传入参数req，下面搜一下ServerResponse
+
+    res.shouldKeepAlive = shouldKeepAlive;
+    DTRACE_HTTP_SERVER_REQUEST(req, socket);
+    COUNTER_HTTP_SERVER_REQUEST();
+
+    if (socket._httpMessage) {
+      // There are already pending outgoing res, append.
+      outgoing.push(res);
+    } else {
+      res.assignSocket(socket);
+    }
+
+    // When we're finished writing the response, check if this is the last
+    // respose, if so destroy the socket.
+    res.on('prefinish', resOnFinish);
+    function resOnFinish() {
+      // Usually the first incoming element should be our request.  it may
+      // be that in the case abortIncoming() was called that the incoming
+      // array will be empty.
+      assert(incoming.length === 0 || incoming[0] === req);
+
+      incoming.shift();
+
+      // if the user never called req.read(), and didn't pipe() or
+      // .resume() or .on('data'), then we call req._dump() so that the
+      // bytes will be pulled off the wire.
+      if (!req._consuming && !req._readableState.resumeScheduled)
+        req._dump();
+
+      res.detachSocket(socket);
+
+      if (res._last) {
+        socket.destroySoon();
+      } else {
+        // start sending the next message
+        var m = outgoing.shift();
+        if (m) {
+          m.assignSocket(socket);
+        }
+      }
+    }
+
+    if (!util.isUndefined(req.headers.expect) &&
+        (req.httpVersionMajor == 1 && req.httpVersionMinor == 1) &&
+        continueExpression.test(req.headers['expect'])) {
+      res._expect_continue = true;
+      if (EventEmitter.listenerCount(self, 'checkContinue') > 0) {
+        self.emit('checkContinue', req, res);
+      } else {
+        res.writeContinue();
+        self.emit('request', req, res);//5.触发request事件。下面查看req和res是怎么生成的，parserOnIncoming函数中有req参数，所以req肯定不是在parserOnIncoming函数中生成的
+      }
+    } else {
+      self.emit('request', req, res);
+    }
+    return false; // Not a HEAD response. (Not even a response!)
+  }
+}
+exports._connectionListener = connectionListener;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//_http_outgoing.js*********************************
+//_http_outgoing.js*********************************
+//_http_outgoing.js*********************************
+//_http_outgoing.js*********************************
+//_http_outgoing.js*********************************
+
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+var assert = require('assert').ok;
+var Stream = require('stream');
+var timers = require('timers');
+var util = require('util');
+var Buffer = require('buffer').Buffer;
+var common = require('_http_common');
+
+var CRLF = common.CRLF;
+var chunkExpression = common.chunkExpression;
+var debug = common.debug;
+
+
+var connectionExpression = /Connection/i;
+var transferEncodingExpression = /Transfer-Encoding/i;
+var closeExpression = /close/i;
+var contentLengthExpression = /Content-Length/i;
+var dateExpression = /Date/i;
+var expectExpression = /Expect/i;
+
+var lenientHttpHeaders = !!process.REVERT_CVE_2016_2216;
+
+function escapeHeaderValue(value) {
+  if (!lenientHttpHeaders) return value;
+  // Protect against response splitting. The regex test is there to
+  // minimize the performance impact in the common case.
+  return /[\r\n]/.test(value) ? value.replace(/[\r\n]+[ \t]*/g, '') : value;
+}
+
+var automaticHeaders = {
+  connection: true,
+  'content-length': true,
+  'transfer-encoding': true,
+  date: true
+};
+
+
+var dateCache;
+function utcDate() {
+  if (!dateCache) {
+    var d = new Date();
+    dateCache = d.toUTCString();
+    timers.enroll(utcDate, 1000 - d.getMilliseconds());
+    timers._unrefActive(utcDate);
+  }
+  return dateCache;
+}
+utcDate._onTimeout = function() {
+  dateCache = undefined;
+};
+
+//11.OutgoingMessage方法中初始化了很多的属性，是和服务器返回内容相关的一些设置。http.js中的res到此可以了，下面看看http.js中的req
+function OutgoingMessage() {
+  Stream.call(this);
+
+  this.output = [];
+  this.outputEncodings = [];
+  this.outputCallbacks = [];
+
+  this.writable = true;
+
+  this._last = false;
+  this.chunkedEncoding = false;
+  this.shouldKeepAlive = true;
+  this.useChunkedEncodingByDefault = true;
+  this.sendDate = false;
+  this._removedHeader = {};
+
+  this._hasBody = true;
+  this._trailer = '';
+
+  this.finished = false;
+  this._hangupClose = false;
+  this._headerSent = false;
+
+  this.socket = null;
+  this.connection = null;
+  this._header = null;
+  this._headers = null;
+  this._headerNames = {};
+}
+util.inherits(OutgoingMessage, Stream);//13.OutgoingMessage继承了Stream，是Stream的一个子类
+
+
+exports.OutgoingMessage = OutgoingMessage;//12.OutgoingMessage作为借口被暴露出去
+
+
+OutgoingMessage.prototype.setTimeout = function(msecs, callback) {
+  if (callback)
+    this.on('timeout', callback);
+  if (!this.socket) {
+    this.once('socket', function(socket) {
+      socket.setTimeout(msecs);
+    });
+  } else
+    this.socket.setTimeout(msecs);
+};
+
+
+// It's possible that the socket will be destroyed, and removed from
+// any messages, before ever calling this.  In that case, just skip
+// it, since something else is destroying this connection anyway.
+OutgoingMessage.prototype.destroy = function(error) {
+  if (this.socket)
+    this.socket.destroy(error);
+  else
+    this.once('socket', function(socket) {
+      socket.destroy(error);
+    });
+};
+
+
+// This abstract either writing directly to the socket or buffering it.
+OutgoingMessage.prototype._send = function(data, encoding, callback) {
+  // This is a shameful hack to get the headers and first body chunk onto
+  // the same packet. Future versions of Node are going to take care of
+  // this at a lower level and in a more general way.
+  if (!this._headerSent) {
+    if (util.isString(data) &&
+        encoding !== 'hex' &&
+        encoding !== 'base64') {
+      data = this._header + data;
+    } else {
+      this.output.unshift(this._header);
+      this.outputEncodings.unshift('binary');
+      this.outputCallbacks.unshift(null);
+    }
+    this._headerSent = true;
+  }
+  return this._writeRaw(data, encoding, callback);
+};
+
+
+OutgoingMessage.prototype._writeRaw = function(data, encoding, callback) {
+  if (util.isFunction(encoding)) {
+    callback = encoding;
+    encoding = null;
+  }
+
+  if (data.length === 0) {
+    if (util.isFunction(callback))
+      process.nextTick(callback);
+    return true;
+  }
+
+  if (this.connection &&
+      this.connection._httpMessage === this &&
+      this.connection.writable &&
+      !this.connection.destroyed) {
+    // There might be pending data in the this.output buffer.
+    while (this.output.length) {
+      if (!this.connection.writable) {
+        this._buffer(data, encoding, callback);
+        return false;
+      }
+      var c = this.output.shift();
+      var e = this.outputEncodings.shift();
+      var cb = this.outputCallbacks.shift();
+      this.connection.write(c, e, cb);
+    }
+
+    // Directly write to socket.
+    return this.connection.write(data, encoding, callback);
+  } else if (this.connection && this.connection.destroyed) {
+    // The socket was destroyed.  If we're still trying to write to it,
+    // then we haven't gotten the 'close' event yet.
+    return false;
+  } else {
+    // buffer, as long as we're not destroyed.
+    this._buffer(data, encoding, callback);
+    return false;
+  }
+};
+
+
+OutgoingMessage.prototype._buffer = function(data, encoding, callback) {
+  this.output.push(data);
+  this.outputEncodings.push(encoding);
+  this.outputCallbacks.push(callback);
+  return false;
+};
+
+
+OutgoingMessage.prototype._storeHeader = function(firstLine, headers) {
+  // firstLine in the case of request is: 'GET /index.html HTTP/1.1\r\n'
+  // in the case of response it is: 'HTTP/1.1 200 OK\r\n'
+  var state = {
+    sentConnectionHeader: false,
+    sentContentLengthHeader: false,
+    sentTransferEncodingHeader: false,
+    sentDateHeader: false,
+    sentExpect: false,
+    messageHeader: firstLine
+  };
+
+  var field, value;
+
+  if (headers) {
+    var keys = Object.keys(headers);
+    var isArray = util.isArray(headers);
+    var field, value;
+
+    for (var i = 0, l = keys.length; i < l; i++) {
+      var key = keys[i];
+      if (isArray) {
+        field = headers[key][0];
+        value = headers[key][1];
+      } else {
+        field = key;
+        value = headers[key];
+      }
+
+      if (util.isArray(value)) {
+        for (var j = 0; j < value.length; j++) {
+          storeHeader(this, state, field, value[j]);
+        }
+      } else {
+        storeHeader(this, state, field, value);
+      }
+    }
+  }
+
+  // Date header
+  if (this.sendDate === true && state.sentDateHeader === false) {
+    state.messageHeader += 'Date: ' + utcDate() + CRLF;
+  }
+
+  // Force the connection to close when the response is a 204 No Content or
+  // a 304 Not Modified and the user has set a "Transfer-Encoding: chunked"
+  // header.
+  //
+  // RFC 2616 mandates that 204 and 304 responses MUST NOT have a body but
+  // node.js used to send out a zero chunk anyway to accommodate clients
+  // that don't have special handling for those responses.
+  //
+  // It was pointed out that this might confuse reverse proxies to the point
+  // of creating security liabilities, so suppress the zero chunk and force
+  // the connection to close.
+  var statusCode = this.statusCode;
+  if ((statusCode === 204 || statusCode === 304) &&
+      this.chunkedEncoding === true) {
+    debug(statusCode + ' response should not use chunked encoding,' +
+          ' closing connection.');
+    this.chunkedEncoding = false;
+    this.shouldKeepAlive = false;
+  }
+
+  // keep-alive logic
+  if (this._removedHeader.connection) {
+    this._last = true;
+    this.shouldKeepAlive = false;
+  } else if (state.sentConnectionHeader === false) {
+    var shouldSendKeepAlive = this.shouldKeepAlive &&
+        (state.sentContentLengthHeader ||
+         this.useChunkedEncodingByDefault ||
+         this.agent);
+    if (shouldSendKeepAlive) {
+      state.messageHeader += 'Connection: keep-alive\r\n';
+    } else {
+      this._last = true;
+      state.messageHeader += 'Connection: close\r\n';
+    }
+  }
+
+  if (state.sentContentLengthHeader === false &&
+      state.sentTransferEncodingHeader === false) {
+    if (this._hasBody && !this._removedHeader['transfer-encoding']) {
+      if (this.useChunkedEncodingByDefault) {
+        state.messageHeader += 'Transfer-Encoding: chunked\r\n';
+        this.chunkedEncoding = true;
+      } else {
+        this._last = true;
+      }
+    } else {
+      // Make sure we don't end the 0\r\n\r\n at the end of the message.
+      this.chunkedEncoding = false;
+    }
+  }
+
+  this._header = state.messageHeader + CRLF;
+  this._headerSent = false;
+
+  // wait until the first body chunk, or close(), is sent to flush,
+  // UNLESS we're sending Expect: 100-continue.
+  if (state.sentExpect) this._send('');
+};
+
+function storeHeader(self, state, field, value) {
+  if (!lenientHttpHeaders) {
+    if (!common._checkIsHttpToken(field)) {
+      throw new TypeError(
+          'Header name must be a valid HTTP Token ["' + field + '"]');
+    }
+    if (common._checkInvalidHeaderChar(value) === true) {
+      throw new TypeError('The header content contains invalid characters');
+    }
+  }
+  state.messageHeader += field + ': ' + escapeHeaderValue(value) + CRLF;
+
+  if (connectionExpression.test(field)) {
+    state.sentConnectionHeader = true;
+    if (closeExpression.test(value)) {
+      self._last = true;
+    } else {
+      self.shouldKeepAlive = true;
+    }
+
+  } else if (transferEncodingExpression.test(field)) {
+    state.sentTransferEncodingHeader = true;
+    if (chunkExpression.test(value)) self.chunkedEncoding = true;
+
+  } else if (contentLengthExpression.test(field)) {
+    state.sentContentLengthHeader = true;
+  } else if (dateExpression.test(field)) {
+    state.sentDateHeader = true;
+  } else if (expectExpression.test(field)) {
+    state.sentExpect = true;
+  }
+}
+
+
+OutgoingMessage.prototype.setHeader = function(name, value) {
+  if (typeof name !== 'string')
+    throw new TypeError('"name" should be a string');
+  if (value === undefined)
+    throw new Error('"name" and "value" are required for setHeader().');
+  if (this._header)
+    throw new Error('Can\'t set headers after they are sent.');
+  if (!lenientHttpHeaders) {
+    if (!common._checkIsHttpToken(name)) {
+      throw new TypeError(
+          'Trailer name must be a valid HTTP Token ["' + name + '"]');
+    }
+    if (common._checkInvalidHeaderChar(value) === true) {
+      throw new TypeError('The header content contains invalid characters');
+    }
+  }
+  if (this._headers === null)
+    this._headers = {};
+
+  var key = name.toLowerCase();
+  this._headers[key] = value;
+  this._headerNames[key] = name;
+
+  if (automaticHeaders[key])
+    this._removedHeader[key] = false;
+};
+
+
+OutgoingMessage.prototype.getHeader = function(name) {
+  if (arguments.length < 1) {
+    throw new Error('`name` is required for getHeader().');
+  }
+
+  if (!this._headers) return;
+
+  var key = name.toLowerCase();
+  return this._headers[key];
+};
+
+
+OutgoingMessage.prototype.removeHeader = function(name) {
+  if (arguments.length < 1) {
+    throw new Error('`name` is required for removeHeader().');
+  }
+
+  if (this._header) {
+    throw new Error('Can\'t remove headers after they are sent.');
+  }
+
+  var key = name.toLowerCase();
+
+  if (key === 'date')
+    this.sendDate = false;
+  else if (automaticHeaders[key])
+    this._removedHeader[key] = true;
+
+  if (this._headers) {
+    delete this._headers[key];
+    delete this._headerNames[key];
+  }
+};
+
+
+OutgoingMessage.prototype._renderHeaders = function() {
+  if (this._header) {
+    throw new Error('Can\'t render headers after they are sent to the client.');
+  }
+
+  if (!this._headers) return {};
+
+  var headers = {};
+  var keys = Object.keys(this._headers);
+
+  for (var i = 0, l = keys.length; i < l; i++) {
+    var key = keys[i];
+    headers[this._headerNames[key]] = this._headers[key];
+  }
+  return headers;
+};
+
+
+Object.defineProperty(OutgoingMessage.prototype, 'headersSent', {
+  configurable: true,
+  enumerable: true,
+  get: function() { return !!this._header; }
+});
+
+
+OutgoingMessage.prototype.write = function(chunk, encoding, callback) {
+  var self = this;
+
+  if (this.finished) {
+    var err = new Error('write after end');
+    process.nextTick(function() {
+      self.emit('error', err);
+      if (callback) callback(err);
+    });
+
+    return true;
+  }
+
+  if (!this._header) {
+    this._implicitHeader();
+  }
+
+  if (!this._hasBody) {
+    debug('This type of response MUST NOT have a body. ' +
+          'Ignoring write() calls.');
+    return true;
+  }
+
+  if (!util.isString(chunk) && !util.isBuffer(chunk)) {
+    throw new TypeError('first argument must be a string or Buffer');
+  }
+
+
+  // If we get an empty string or buffer, then just do nothing, and
+  // signal the user to keep writing.
+  if (chunk.length === 0) return true;
+
+  var len, ret;
+  if (this.chunkedEncoding) {
+    if (util.isString(chunk) &&
+        encoding !== 'hex' &&
+        encoding !== 'base64' &&
+        encoding !== 'binary') {
+      len = Buffer.byteLength(chunk, encoding);
+      chunk = len.toString(16) + CRLF + chunk + CRLF;
+      ret = this._send(chunk, encoding, callback);
+    } else {
+      // buffer, or a non-toString-friendly encoding
+      if (util.isString(chunk))
+        len = Buffer.byteLength(chunk, encoding);
+      else
+        len = chunk.length;
+
+      if (this.connection && !this.connection.corked) {
+        this.connection.cork();
+        var conn = this.connection;
+        process.nextTick(function connectionCork() {
+          if (conn)
+            conn.uncork();
+        });
+      }
+      this._send(len.toString(16), 'binary', null);
+      this._send(crlf_buf, null, null);
+      this._send(chunk, encoding, null);
+      ret = this._send(crlf_buf, null, callback);
+    }
+  } else {
+    ret = this._send(chunk, encoding, callback);
+  }
+
+  debug('write ret = ' + ret);
+  return ret;
+};
+
+
+OutgoingMessage.prototype.addTrailers = function(headers) {
+  this._trailer = '';
+  var keys = Object.keys(headers);
+  var isArray = util.isArray(headers);
+  var field, value;
+  for (var i = 0, l = keys.length; i < l; i++) {
+    var key = keys[i];
+    if (isArray) {
+      field = headers[key][0];
+      value = headers[key][1];
+    } else {
+      field = key;
+      value = headers[key];
+    }
+
+    if (!lenientHttpHeaders) {
+      if (!common._checkIsHttpToken(field)) {
+        throw new TypeError(
+            'Trailer name must be a valid HTTP Token ["' + field + '"]');
+      }
+      if (common._checkInvalidHeaderChar(value) === true) {
+        throw new TypeError('The header content contains invalid characters');
+      }
+    }
+    this._trailer += field + ': ' + escapeHeaderValue(value) + CRLF;
+  }
+};
+
+
+var crlf_buf = new Buffer('\r\n');
+
+
+OutgoingMessage.prototype.end = function(data, encoding, callback) {
+  if (util.isFunction(data)) {
+    callback = data;
+    data = null;
+  } else if (util.isFunction(encoding)) {
+    callback = encoding;
+    encoding = null;
+  }
+
+  if (data && !util.isString(data) && !util.isBuffer(data)) {
+    throw new TypeError('first argument must be a string or Buffer');
+  }
+
+  if (this.finished) {
+    return false;
+  }
+
+  var self = this;
+  function finish() {
+    self.emit('finish');
+  }
+
+  if (util.isFunction(callback))
+    this.once('finish', callback);
+
+
+  if (!this._header) {
+    this._implicitHeader();
+  }
+
+  if (data && !this._hasBody) {
+    debug('This type of response MUST NOT have a body. ' +
+          'Ignoring data passed to end().');
+    data = null;
+  }
+
+  if (this.connection && data)
+    this.connection.cork();
+
+  var ret;
+  if (data) {
+    // Normal body write.
+    ret = this.write(data, encoding);
+  }
+
+  if (this._hasBody && this.chunkedEncoding) {
+    ret = this._send('0\r\n' + this._trailer + '\r\n', 'binary', finish);
+  } else {
+    // Force a flush, HACK.
+    ret = this._send('', 'binary', finish);
+  }
+
+  if (this.connection && data)
+    this.connection.uncork();
+
+  this.finished = true;
+
+  // There is the first message on the outgoing queue, and we've sent
+  // everything to the socket.
+  debug('outgoing message end.');
+  if (this.output.length === 0 && this.connection._httpMessage === this) {
+    this._finish();
+  }
+
+  return ret;
+};
+
+
+OutgoingMessage.prototype._finish = function() {
+  assert(this.connection);
+  this.emit('prefinish');
+};
+
+
+// This logic is probably a bit confusing. Let me explain a bit:
+//
+// In both HTTP servers and clients it is possible to queue up several
+// outgoing messages. This is easiest to imagine in the case of a client.
+// Take the following situation:
+//
+//    req1 = client.request('GET', '/');
+//    req2 = client.request('POST', '/');
+//
+// When the user does
+//
+//   req2.write('hello world\n');
+//
+// it's possible that the first request has not been completely flushed to
+// the socket yet. Thus the outgoing messages need to be prepared to queue
+// up data internally before sending it on further to the socket's queue.
+//
+// This function, outgoingFlush(), is called by both the Server and Client
+// to attempt to flush any pending messages out to the socket.
+OutgoingMessage.prototype._flush = function() {
+  if (this.socket && this.socket.writable) {
+    var ret;
+    while (this.output.length) {
+      var data = this.output.shift();
+      var encoding = this.outputEncodings.shift();
+      var cb = this.outputCallbacks.shift();
+      ret = this.socket.write(data, encoding, cb);
+    }
+
+    if (this.finished) {
+      // This is a queue to the server or client to bring in the next this.
+      this._finish();
+    } else if (ret) {
+      // This is necessary to prevent https from breaking
+      this.emit('drain');
+    }
+  }
+};
+
+
+OutgoingMessage.prototype.flushHeaders = function outgoingFlushHeaders() {
+  if (!this._header) {
+    // Force-flush the headers.
+    this._implicitHeader();
+    this._send('');
+  }
+
+
+
+
+
+
+
+
+  
+  
+  
+  
+
+
+
+
+
+
+
+//http_common.js************************************
+//http_common.js************************************
+//http_common.js************************************
+//http_common.js************************************
+//http_common.js************************************
+
+  // Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+var FreeList = require('freelist').FreeList;
+var HTTPParser = process.binding('http_parser').HTTPParser;
+
+var incoming = require('_http_incoming');
+var IncomingMessage = incoming.IncomingMessage;//20.IncomingMessage是来自_http_incoming私有模块下的incoming.IncomingMessage。好了，req就是IncomingMessage的一个实例，之前已经知道res是ServerRespond的一个实例
+var readStart = incoming.readStart;
+var readStop = incoming.readStop;
+
+var isNumber = require('util').isNumber;
+var debug = require('util').debuglog('http');
+exports.debug = debug;
+
+exports.CRLF = '\r\n';
+exports.chunkExpression = /chunk/i;
+exports.continueExpression = /100-continue/i;
+exports.methods = HTTPParser.methods;
+
+var kOnHeaders = HTTPParser.kOnHeaders | 0;
+var kOnHeadersComplete = HTTPParser.kOnHeadersComplete | 0;
+var kOnBody = HTTPParser.kOnBody | 0;
+var kOnMessageComplete = HTTPParser.kOnMessageComplete | 0;
+
+// Only called in the slow case where slow means
+// that the request headers were either fragmented
+// across multiple TCP packets or too large to be
+// processed in a single run. This method is also
+// called to process trailing HTTP headers.
+function parserOnHeaders(headers, url) {
+  // Once we exceeded headers limit - stop collecting them
+  if (this.maxHeaderPairs <= 0 ||
+      this._headers.length < this.maxHeaderPairs) {
+    this._headers = this._headers.concat(headers);
+  }
+  this._url += url;
+}
+
+// info.headers and info.url are set only if .onHeaders()
+// has not been called for this request.
+//
+// info.url is not set for response parsers but that's not
+// applicable here since all our parsers are request parsers.
+function parserOnHeadersComplete(info) {
+  debug('parserOnHeadersComplete', info);
+  var parser = this;
+  var headers = info.headers;
+  var url = info.url;
+
+  if (!headers) {
+    headers = parser._headers;
+    parser._headers = [];
+  }
+
+  if (!url) {
+    url = parser._url;
+    parser._url = '';
+  }
+
+  parser.incoming = new IncomingMessage(parser.socket);//19.parser.incoming是一个IncomingMessage对象实例，将parser的套接字给了parser.incoming。下面看看IncomingMessage是什么
+  parser.incoming.httpVersionMajor = info.versionMajor;
+  parser.incoming.httpVersionMinor = info.versionMinor;
+  parser.incoming.httpVersion = info.versionMajor + '.' + info.versionMinor;
+  parser.incoming.url = url;
+
+  var n = headers.length;
+
+  // If parser.maxHeaderPairs <= 0 - assume that there're no limit
+  if (parser.maxHeaderPairs > 0) {
+    n = Math.min(n, parser.maxHeaderPairs);
+  }
+
+  parser.incoming._addHeaderLines(headers, n);
+
+  if (isNumber(info.method)) {
+    // server only
+    parser.incoming.method = HTTPParser.methods[info.method];
+  } else {
+    // client only
+    parser.incoming.statusCode = info.statusCode;
+    parser.incoming.statusMessage = info.statusMessage;
+  }
+
+  parser.incoming.upgrade = info.upgrade;
+
+  var skipBody = false; // response to HEAD or CONNECT
+
+  if (!info.upgrade) {
+    // For upgraded connections and CONNECT method request,
+    // we'll emit this after parser.execute
+    // so that we can capture the first part of the new protocol
+    skipBody = parser.onIncoming(parser.incoming, info.shouldKeepAlive);//18.调用了onIncoming，这边的第一个参数就是req，第二个参数就是shouldKeepAlive。那么这个parser.incoming又是什么
+  }
+
+  return skipBody;
+}
+
+// XXX This is a mess.
+// TODO: http.Parser should be a Writable emits request/response events.
+function parserOnBody(b, start, len) {
+  var parser = this;
+  var stream = parser.incoming;
+
+  // if the stream has already been removed, then drop it.
+  if (!stream)
+    return;
+
+  var socket = stream.socket;
+
+  // pretend this was the result of a stream._read call.
+  if (len > 0 && !stream._dumped) {
+    var slice = b.slice(start, start + len);
+    var ret = stream.push(slice);
+    if (!ret)
+      readStop(socket);
+  }
+}
+
+function parserOnMessageComplete() {
+  var parser = this;
+  var stream = parser.incoming;
+
+  if (stream) {
+    stream.complete = true;
+    // Emit any trailing headers.
+    var headers = parser._headers;
+    if (headers) {
+      parser.incoming._addHeaderLines(headers, headers.length);
+      parser._headers = [];
+      parser._url = '';
+    }
+
+    if (!stream.upgrade)
+      // For upgraded connections, also emit this after parser.execute
+      stream.push(null);
+  }
+
+  if (stream && !parser.incoming._pendings.length) {
+    // For emit end event
+    stream.push(null);
+  }
+
+  // force to read the next incoming message
+  readStart(parser.socket);
+}
+
+
+var parsers = new FreeList('parsers', 1000, function() {
+  var parser = new HTTPParser(HTTPParser.REQUEST);
+
+  parser._headers = [];
+  parser._url = '';
+
+  // Only called in the slow case where slow means
+  // that the request headers were either fragmented
+  // across multiple TCP packets or too large to be
+  // processed in a single run. This method is also
+  // called to process trailing HTTP headers.
+  parser[kOnHeaders] = parserOnHeaders;
+  parser[kOnHeadersComplete] = parserOnHeadersComplete;
+  parser[kOnBody] = parserOnBody;
+  parser[kOnMessageComplete] = parserOnMessageComplete;
+
+  return parser;
+});
+exports.parsers = parsers;
+
+
+// Free the parser and also break any links that it
+// might have to any other things.
+// TODO: All parser data should be attached to a
+// single object, so that it can be easily cleaned
+// up by doing `parser.data = {}`, which should
+// be done in FreeList.free.  `parsers.free(parser)`
+// should be all that is needed.
+function freeParser(parser, req, socket) {
+  if (parser) {
+    parser._headers = [];
+    parser.onIncoming = null;
+    if (parser.socket)
+      parser.socket.parser = null;
+    parser.socket = null;
+    parser.incoming = null;
+    if (parsers.free(parser) === false)
+      parser.close();
+    parser = null;
+  }
+  if (req) {
+    req.parser = null;
+  }
+  if (socket) {
+    socket.parser = null;
+  }
+}
+exports.freeParser = freeParser;
+
+
+function ondrain() {
+  if (this._httpMessage) this._httpMessage.emit('drain');
+}
+
+
+function httpSocketSetup(socket) {
+  socket.removeListener('drain', ondrain);
+  socket.on('drain', ondrain);
+}
+exports.httpSocketSetup = httpSocketSetup;
+
+// Verifies that the given val is a valid HTTP token
+// per the rules defined in RFC 7230
+var token = /^[a-zA-Z0-9_!#$%&'*+.^`|~-]+$/;
+function checkIsHttpToken(val) {
+  return typeof val === 'string' && token.test(val);
+}
+exports._checkIsHttpToken = checkIsHttpToken;
+
+// True if val contains an invalid field-vchar
+//  field-value    = *( field-content / obs-fold )
+//  field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
+//  field-vchar    = VCHAR / obs-text
+function checkInvalidHeaderChar(val) {
+  val = '' + val;
+  for (var i = 0; i < val.length; i++) {
+    var ch = val.charCodeAt(i);
+    if (ch === 9) continue;
+    if (ch <= 31 || ch > 255 || ch === 127) return true;
+  }
+  return false;
+}
+exports._checkInvalidHeaderChar = checkInvalidHeaderChar;
+
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//net.js************************************
+//net.js************************************
+//net.js************************************
+//net.js************************************
+//net.js************************************
+
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+'use strict';
+
+const EventEmitter = require('events');
+const stream = require('stream');
+const timers = require('timers');
+const util = require('util');
+const internalUtil = require('internal/util');
+const internalNet = require('internal/net');
+const assert = require('assert');
+const cares = process.binding('cares_wrap');
+const uv = process.binding('uv');
+
+const Buffer = require('buffer').Buffer;
+const TTYWrap = process.binding('tty_wrap');
+const TCP = process.binding('tcp_wrap').TCP;
+const Pipe = process.binding('pipe_wrap').Pipe;
+const TCPConnectWrap = process.binding('tcp_wrap').TCPConnectWrap;
+const PipeConnectWrap = process.binding('pipe_wrap').PipeConnectWrap;
+const ShutdownWrap = process.binding('stream_wrap').ShutdownWrap;
+const WriteWrap = process.binding('stream_wrap').WriteWrap;
+
+
+var cluster;
+const errnoException = util._errnoException;
+const exceptionWithHostPort = util._exceptionWithHostPort;
+const isLegalPort = internalNet.isLegalPort;
+
+function noop() {}
+
+function createHandle(fd) {
+  var type = TTYWrap.guessHandleType(fd);
+  if (type === 'PIPE') return new Pipe();
+  if (type === 'TCP') return new TCP();
+  throw new TypeError('Unsupported fd type: ' + type);
+}
+
+
+const debug = util.debuglog('net');
+
+function isPipeName(s) {
+  return typeof s === 'string' && toNumber(s) === false;
+}
+
+exports.createServer = function(options, connectionListener) {
+  return new Server(options, connectionListener);
+};
+
+
+// Target API:
+//
+// var s = net.connect({port: 80, host: 'google.com'}, function() {
+//   ...
+// });
+//
+// There are various forms:
+//
+// connect(options, [cb])
+// connect(port, [host], [cb])
+// connect(path, [cb]);
+//
+exports.connect = exports.createConnection = function() {
+  const args = new Array(arguments.length);
+  for (var i = 0; i < arguments.length; i++)
+    args[i] = arguments[i];
+  // TODO(joyeecheung): use destructuring when V8 is fast enough
+  const normalized = normalizeArgs(args);
+  const options = normalized[0];
+  const cb = normalized[1];
+  debug('createConnection', normalized);
+  const socket = new Socket(options);
+
+  if (options.timeout) {
+    socket.setTimeout(options.timeout);
+  }
+
+  return Socket.prototype.connect.call(socket, options, cb);
+};
+
+
+// Returns an array [options, cb], where options is an object,
+// cb is either a funciton or null.
+// Used to normalize arguments of Socket.prototype.connect() and
+// Server.prototype.listen(). Possible combinations of paramters:
+//   (options[...][, cb])
+//   (path[...][, cb])
+//   ([port][, host][...][, cb])
+// For Socket.prototype.connect(), the [...] part is ignored
+// For Server.prototype.listen(), the [...] part is [, backlog]
+// but will not be handled here (handled in listen())
+function normalizeArgs(args) {
+  if (args.length === 0) {
+    return [{}, null];
+  }
+
+  const arg0 = args[0];
+  var options = {};
+  if (typeof arg0 === 'object' && arg0 !== null) {
+    // (options[...][, cb])
+    options = arg0;
+  } else if (isPipeName(arg0)) {
+    // (path[...][, cb])
+    options.path = arg0;
+  } else {
+    // ([port][, host][...][, cb])
+    options.port = arg0;
+    if (args.length > 1 && typeof args[1] === 'string') {
+      options.host = args[1];
+    }
+  }
+
+  var cb = args[args.length - 1];
+  if (typeof cb !== 'function')
+    return [options, null];
+  else
+    return [options, cb];
+}
+exports._normalizeArgs = normalizeArgs;
+
+
+// called when creating new Socket, or when re-using a closed Socket
+function initSocketHandle(self) {
+  self.destroyed = false;
+  self._bytesDispatched = 0;
+  self._sockname = null;
+
+  // Handle creation may be deferred to bind() or connect() time.
+  if (self._handle) {
+    self._handle.owner = self;
+    self._handle.onread = onread;
+
+    // If handle doesn't support writev - neither do we
+    if (!self._handle.writev)
+      self._writev = null;
+  }
+}
+
+
+const BYTES_READ = Symbol('bytesRead');
+
+
+function Socket(options) {
+  if (!(this instanceof Socket)) return new Socket(options);
+
+  this.connecting = false;
+  this._hadError = false;
+  this._handle = null;
+  this._parent = null;
+  this._host = null;
+
+  if (typeof options === 'number')
+    options = { fd: options }; // Legacy interface.
+  else if (options === undefined)
+    options = {};
+
+  stream.Duplex.call(this, options);
+
+  if (options.handle) {
+    this._handle = options.handle; // private
+  } else if (options.fd !== undefined) {
+    this._handle = createHandle(options.fd);
+    this._handle.open(options.fd);
+    // options.fd can be string (since it user-defined),
+    // so changing this to === would be semver-major
+    // See: https://github.com/nodejs/node/pull/11513
+    if ((options.fd == 1 || options.fd == 2) &&
+        (this._handle instanceof Pipe) &&
+        process.platform === 'win32') {
+      // Make stdout and stderr blocking on Windows
+      var err = this._handle.setBlocking(true);
+      if (err)
+        throw errnoException(err, 'setBlocking');
+    }
+    this.readable = options.readable !== false;
+    this.writable = options.writable !== false;
+  } else {
+    // these will be set once there is a connection
+    this.readable = this.writable = false;
+  }
+
+  // shut down the socket when we're finished with it.
+  this.on('finish', onSocketFinish);
+  this.on('_socketEnd', onSocketEnd);
+
+  initSocketHandle(this);
+
+  this._pendingData = null;
+  this._pendingEncoding = '';
+
+  // handle strings directly
+  this._writableState.decodeStrings = false;
+
+  // default to *not* allowing half open sockets
+  this.allowHalfOpen = options && options.allowHalfOpen || false;
+
+  // if we have a handle, then start the flow of data into the
+  // buffer.  if not, then this will happen when we connect
+  if (this._handle && options.readable !== false) {
+    if (options.pauseOnCreate) {
+      // stop the handle from reading and pause the stream
+      this._handle.reading = false;
+      this._handle.readStop();
+      this._readableState.flowing = false;
+    } else {
+      this.read(0);
+    }
+  }
+
+  // Reserve properties
+  this.server = null;
+  this._server = null;
+
+  // Used after `.destroy()`
+  this[BYTES_READ] = 0;
+}
+util.inherits(Socket, stream.Duplex);
+
+Socket.prototype._unrefTimer = function _unrefTimer() {
+  for (var s = this; s !== null; s = s._parent)
+    timers._unrefActive(s);
+};
+
+// the user has called .end(), and all the bytes have been
+// sent out to the other side.
+function onSocketFinish() {
+  // If still connecting - defer handling 'finish' until 'connect' will happen
+  if (this.connecting) {
+    debug('osF: not yet connected');
+    return this.once('connect', onSocketFinish);
+  }
+
+  debug('onSocketFinish');
+  if (!this.readable || this._readableState.ended) {
+    debug('oSF: ended, destroy', this._readableState);
+    return this.destroy();
+  }
+
+  debug('oSF: not ended, call shutdown()');
+
+  // otherwise, just shutdown, or destroy() if not possible
+  if (!this._handle || !this._handle.shutdown)
+    return this.destroy();
+
+  var req = new ShutdownWrap();
+  req.oncomplete = afterShutdown;
+  req.handle = this._handle;
+  var err = this._handle.shutdown(req);
+
+  if (err)
+    return this._destroy(errnoException(err, 'shutdown'));
+}
+
+
+function afterShutdown(status, handle, req) {
+  var self = handle.owner;
+
+  debug('afterShutdown destroyed=%j', self.destroyed,
+        self._readableState);
+
+  // callback may come after call to destroy.
+  if (self.destroyed)
+    return;
+
+  if (self._readableState.ended) {
+    debug('readableState ended, destroying');
+    self.destroy();
+  } else {
+    self.once('_socketEnd', self.destroy);
+  }
+}
+
+// the EOF has been received, and no more bytes are coming.
+// if the writable side has ended already, then clean everything
+// up.
+function onSocketEnd() {
+  // XXX Should not have to do as much crap in this function.
+  // ended should already be true, since this is called *after*
+  // the EOF errno and onread has eof'ed
+  debug('onSocketEnd', this._readableState);
+  this._readableState.ended = true;
+  if (this._readableState.endEmitted) {
+    this.readable = false;
+    maybeDestroy(this);
+  } else {
+    this.once('end', function end() {
+      this.readable = false;
+      maybeDestroy(this);
+    });
+    this.read(0);
+  }
+
+  if (!this.allowHalfOpen) {
+    this.write = writeAfterFIN;
+    this.destroySoon();
+  }
+}
+
+// Provide a better error message when we call end() as a result
+// of the other side sending a FIN.  The standard 'write after end'
+// is overly vague, and makes it seem like the user's code is to blame.
+function writeAfterFIN(chunk, encoding, cb) {
+  if (typeof encoding === 'function') {
+    cb = encoding;
+    encoding = null;
+  }
+
+  var er = new Error('This socket has been ended by the other party');
+  er.code = 'EPIPE';
+  // TODO: defer error events consistently everywhere, not just the cb
+  this.emit('error', er);
+  if (typeof cb === 'function') {
+    process.nextTick(cb, er);
+  }
+}
+
+exports.Socket = Socket;
+exports.Stream = Socket; // Legacy naming.
+
+Socket.prototype.read = function(n) {
+  if (n === 0)
+    return stream.Readable.prototype.read.call(this, n);
+
+  this.read = stream.Readable.prototype.read;
+  this._consuming = true;
+  return this.read(n);
+};
+
+
+Socket.prototype.listen = function() {
+  debug('socket.listen');
+  this.on('connection', arguments[0]);
+  listen(this, null, null, null);
+};
+
+
+Socket.prototype.setTimeout = function(msecs, callback) {
+  if (msecs === 0) {
+    timers.unenroll(this);
+    if (callback) {
+      this.removeListener('timeout', callback);
+    }
+  } else {
+    timers.enroll(this, msecs);
+    timers._unrefActive(this);
+    if (callback) {
+      this.once('timeout', callback);
+    }
+  }
+  return this;
+};
+
+
+Socket.prototype._onTimeout = function() {
+  debug('_onTimeout');
+  this.emit('timeout');
+};
+
+
+Socket.prototype.setNoDelay = function(enable) {
+  if (!this._handle) {
+    this.once('connect',
+              enable ? this.setNoDelay : () => this.setNoDelay(enable));
+    return this;
+  }
+
+  // backwards compatibility: assume true when `enable` is omitted
+  if (this._handle.setNoDelay)
+    this._handle.setNoDelay(enable === undefined ? true : !!enable);
+
+  return this;
+};
+
+
+Socket.prototype.setKeepAlive = function(setting, msecs) {
+  if (!this._handle) {
+    this.once('connect', () => this.setKeepAlive(setting, msecs));
+    return this;
+  }
+
+  if (this._handle.setKeepAlive)
+    this._handle.setKeepAlive(setting, ~~(msecs / 1000));
+
+  return this;
+};
+
+
+Socket.prototype.address = function() {
+  return this._getsockname();
+};
+
+
+Object.defineProperty(Socket.prototype, '_connecting', {
+  get: function() {
+    return this.connecting;
+  }
+});
+
+
+Object.defineProperty(Socket.prototype, 'readyState', {
+  get: function() {
+    if (this.connecting) {
+      return 'opening';
+    } else if (this.readable && this.writable) {
+      return 'open';
+    } else if (this.readable && !this.writable) {
+      return 'readOnly';
+    } else if (!this.readable && this.writable) {
+      return 'writeOnly';
+    } else {
+      return 'closed';
+    }
+  }
+});
+
+
+Object.defineProperty(Socket.prototype, 'bufferSize', {
+  get: function() {
+    if (this._handle) {
+      return this._handle.writeQueueSize + this._writableState.length;
+    }
+  }
+});
+
+
+// Just call handle.readStart until we have enough in the buffer
+Socket.prototype._read = function(n) {
+  debug('_read');
+
+  if (this.connecting || !this._handle) {
+    debug('_read wait for connection');
+    this.once('connect', () => this._read(n));
+  } else if (!this._handle.reading) {
+    // not already reading, start the flow
+    debug('Socket._read readStart');
+    this._handle.reading = true;
+    var err = this._handle.readStart();
+    if (err)
+      this._destroy(errnoException(err, 'read'));
+  }
+};
+
+
+Socket.prototype.end = function(data, encoding) {
+  stream.Duplex.prototype.end.call(this, data, encoding);
+  this.writable = false;
+  DTRACE_NET_STREAM_END(this);
+  LTTNG_NET_STREAM_END(this);
+
+  // just in case we're waiting for an EOF.
+  if (this.readable && !this._readableState.endEmitted)
+    this.read(0);
+  else
+    maybeDestroy(this);
+};
+
+
+// Call whenever we set writable=false or readable=false
+function maybeDestroy(socket) {
+  if (!socket.readable &&
+      !socket.writable &&
+      !socket.destroyed &&
+      !socket.connecting &&
+      !socket._writableState.length) {
+    socket.destroy();
+  }
+}
+
+
+Socket.prototype.destroySoon = function() {
+  if (this.writable)
+    this.end();
+
+  if (this._writableState.finished)
+    this.destroy();
+  else
+    this.once('finish', this.destroy);
+};
+
+
+Socket.prototype._destroy = function(exception, cb) {
+  debug('destroy');
+
+  function fireErrorCallbacks(self) {
+    if (cb) cb(exception);
+    if (exception && !self._writableState.errorEmitted) {
+      process.nextTick(emitErrorNT, self, exception);
+      self._writableState.errorEmitted = true;
+    }
+  }
+
+  if (this.destroyed) {
+    debug('already destroyed, fire error callbacks');
+    fireErrorCallbacks(this);
+    return;
+  }
+
+  this.connecting = false;
+
+  this.readable = this.writable = false;
+
+  for (var s = this; s !== null; s = s._parent)
+    timers.unenroll(s);
+
+  debug('close');
+  if (this._handle) {
+    if (this !== process.stderr)
+      debug('close handle');
+    var isException = exception ? true : false;
+    // `bytesRead` should be accessible after `.destroy()`
+    this[BYTES_READ] = this._handle.bytesRead;
+
+    this._handle.close(() => {
+      debug('emit close');
+      this.emit('close', isException);
+    });
+    this._handle.onread = noop;
+    this._handle = null;
+    this._sockname = null;
+  }
+
+  // we set destroyed to true before firing error callbacks in order
+  // to make it re-entrance safe in case Socket.prototype.destroy()
+  // is called within callbacks
+  this.destroyed = true;
+  fireErrorCallbacks(this);
+
+  if (this._server) {
+    COUNTER_NET_SERVER_CONNECTION_CLOSE(this);
+    debug('has server');
+    this._server._connections--;
+    if (this._server._emitCloseIfDrained) {
+      this._server._emitCloseIfDrained();
+    }
+  }
+};
+
+
+Socket.prototype.destroy = function(exception) {
+  debug('destroy', exception);
+  this._destroy(exception);
+};
+
+
+// This function is called whenever the handle gets a
+// buffer, or when there's an error reading.
+function onread(nread, buffer) {
+  var handle = this;
+  var self = handle.owner;
+  assert(handle === self._handle, 'handle != self._handle');
+
+  self._unrefTimer();
+
+  debug('onread', nread);
+
+  if (nread > 0) {
+    debug('got data');
+
+    // read success.
+    // In theory (and in practice) calling readStop right now
+    // will prevent this from being called again until _read() gets
+    // called again.
+
+    // Optimization: emit the original buffer with end points
+    var ret = self.push(buffer);
+
+    if (handle.reading && !ret) {
+      handle.reading = false;
+      debug('readStop');
+      var err = handle.readStop();
+      if (err)
+        self._destroy(errnoException(err, 'read'));
+    }
+    return;
+  }
+
+  // if we didn't get any bytes, that doesn't necessarily mean EOF.
+  // wait for the next one.
+  if (nread === 0) {
+    debug('not any data, keep waiting');
+    return;
+  }
+
+  // Error, possibly EOF.
+  if (nread !== uv.UV_EOF) {
+    return self._destroy(errnoException(nread, 'read'));
+  }
+
+  debug('EOF');
+
+  // push a null to signal the end of data.
+  // Do it before `maybeDestroy` for correct order of events:
+  // `end` -> `close`
+  self.push(null);
+
+  if (self._readableState.length === 0) {
+    self.readable = false;
+    maybeDestroy(self);
+  }
+
+  // internal end event so that we know that the actual socket
+  // is no longer readable, and we can start the shutdown
+  // procedure. No need to wait for all the data to be consumed.
+  self.emit('_socketEnd');
+}
+
+
+Socket.prototype._getpeername = function() {
+  if (!this._peername) {
+    if (!this._handle || !this._handle.getpeername) {
+      return {};
+    }
+    var out = {};
+    var err = this._handle.getpeername(out);
+    if (err) return {};  // FIXME(bnoordhuis) Throw?
+    this._peername = out;
+  }
+  return this._peername;
+};
+
+function protoGetter(name, callback) {
+  Object.defineProperty(Socket.prototype, name, {
+    configurable: false,
+    enumerable: true,
+    get: callback
+  });
+}
+
+protoGetter('bytesRead', function bytesRead() {
+  return this._handle ? this._handle.bytesRead : this[BYTES_READ];
+});
+
+protoGetter('remoteAddress', function remoteAddress() {
+  return this._getpeername().address;
+});
+
+protoGetter('remoteFamily', function remoteFamily() {
+  return this._getpeername().family;
+});
+
+protoGetter('remotePort', function remotePort() {
+  return this._getpeername().port;
+});
+
+
+Socket.prototype._getsockname = function() {
+  if (!this._handle || !this._handle.getsockname) {
+    return {};
+  }
+  if (!this._sockname) {
+    var out = {};
+    var err = this._handle.getsockname(out);
+    if (err) return {};  // FIXME(bnoordhuis) Throw?
+    this._sockname = out;
+  }
+  return this._sockname;
+};
+
+
+protoGetter('localAddress', function localAddress() {
+  return this._getsockname().address;
+});
+
+
+protoGetter('localPort', function localPort() {
+  return this._getsockname().port;
+});
+
+
+Socket.prototype.write = function(chunk, encoding, cb) {
+  if (typeof chunk !== 'string' && !(chunk instanceof Buffer)) {
+    throw new TypeError(
+      'Invalid data, chunk must be a string or buffer, not ' + typeof chunk);
+  }
+  return stream.Duplex.prototype.write.apply(this, arguments);
+};
+
+
+Socket.prototype._writeGeneric = function(writev, data, encoding, cb) {
+  // If we are still connecting, then buffer this for later.
+  // The Writable logic will buffer up any more writes while
+  // waiting for this one to be done.
+  if (this.connecting) {
+    this._pendingData = data;
+    this._pendingEncoding = encoding;
+    this.once('connect', function connect() {
+      this._writeGeneric(writev, data, encoding, cb);
+    });
+    return;
+  }
+  this._pendingData = null;
+  this._pendingEncoding = '';
+
+  this._unrefTimer();
+
+  if (!this._handle) {
+    this._destroy(new Error('This socket is closed'), cb);
+    return false;
+  }
+
+  var req = new WriteWrap();
+  req.handle = this._handle;
+  req.oncomplete = afterWrite;
+  req.async = false;
+  var err;
+
+  if (writev) {
+    var chunks = new Array(data.length << 1);
+    for (var i = 0; i < data.length; i++) {
+      var entry = data[i];
+      chunks[i * 2] = entry.chunk;
+      chunks[i * 2 + 1] = entry.encoding;
+    }
+    err = this._handle.writev(req, chunks);
+
+    // Retain chunks
+    if (err === 0) req._chunks = chunks;
+  } else {
+    var enc;
+    if (data instanceof Buffer) {
+      enc = 'buffer';
+    } else {
+      enc = encoding;
+    }
+    err = createWriteReq(req, this._handle, data, enc);
+  }
+
+  if (err)
+    return this._destroy(errnoException(err, 'write', req.error), cb);
+
+  this._bytesDispatched += req.bytes;
+
+  // If it was entirely flushed, we can write some more right now.
+  // However, if more is left in the queue, then wait until that clears.
+  if (req.async && this._handle.writeQueueSize != 0)
+    req.cb = cb;
+  else
+    cb();
+};
+
+
+Socket.prototype._writev = function(chunks, cb) {
+  this._writeGeneric(true, chunks, '', cb);
+};
+
+
+Socket.prototype._write = function(data, encoding, cb) {
+  this._writeGeneric(false, data, encoding, cb);
+};
+
+function createWriteReq(req, handle, data, encoding) {
+  switch (encoding) {
+    case 'latin1':
+    case 'binary':
+      return handle.writeLatin1String(req, data);
+
+    case 'buffer':
+      return handle.writeBuffer(req, data);
+
+    case 'utf8':
+    case 'utf-8':
+      return handle.writeUtf8String(req, data);
+
+    case 'ascii':
+      return handle.writeAsciiString(req, data);
+
+    case 'ucs2':
+    case 'ucs-2':
+    case 'utf16le':
+    case 'utf-16le':
+      return handle.writeUcs2String(req, data);
+
+    default:
+      return handle.writeBuffer(req, Buffer.from(data, encoding));
+  }
+}
+
+
+protoGetter('bytesWritten', function bytesWritten() {
+  var bytes = this._bytesDispatched;
+  const state = this._writableState;
+  const data = this._pendingData;
+  const encoding = this._pendingEncoding;
+
+  if (!state)
+    return undefined;
+
+  state.getBuffer().forEach(function(el) {
+    if (el.chunk instanceof Buffer)
+      bytes += el.chunk.length;
+    else
+      bytes += Buffer.byteLength(el.chunk, el.encoding);
+  });
+
+  if (data) {
+    if (data instanceof Buffer)
+      bytes += data.length;
+    else
+      bytes += Buffer.byteLength(data, encoding);
+  }
+
+  return bytes;
+});
+
+
+function afterWrite(status, handle, req, err) {
+  var self = handle.owner;
+  if (self !== process.stderr && self !== process.stdout)
+    debug('afterWrite', status);
+
+  // callback may come after call to destroy.
+  if (self.destroyed) {
+    debug('afterWrite destroyed');
+    return;
+  }
+
+  if (status < 0) {
+    var ex = errnoException(status, 'write', req.error);
+    debug('write failure', ex);
+    self._destroy(ex, req.cb);
+    return;
+  }
+
+  self._unrefTimer();
+
+  if (self !== process.stderr && self !== process.stdout)
+    debug('afterWrite call cb');
+
+  if (req.cb)
+    req.cb.call(self);
+}
+
+
+function connect(self, address, port, addressType, localAddress, localPort) {
+  // TODO return promise from Socket.prototype.connect which
+  // wraps _connectReq.
+
+  assert.ok(self.connecting);
+
+  var err;
+
+  if (localAddress || localPort) {
+    var bind;
+
+    if (addressType === 4) {
+      localAddress = localAddress || '0.0.0.0';
+      bind = self._handle.bind;
+    } else if (addressType === 6) {
+      localAddress = localAddress || '::';
+      bind = self._handle.bind6;
+    } else {
+      self._destroy(new TypeError('Invalid addressType: ' + addressType));
+      return;
+    }
+
+    debug('binding to localAddress: %s and localPort: %d',
+          localAddress,
+          localPort);
+
+    bind = bind.bind(self._handle);
+    err = bind(localAddress, localPort);
+
+    if (err) {
+      const ex = exceptionWithHostPort(err, 'bind', localAddress, localPort);
+      self._destroy(ex);
+      return;
+    }
+  }
+
+  if (addressType === 6 || addressType === 4) {
+    const req = new TCPConnectWrap();
+    req.oncomplete = afterConnect;
+    req.address = address;
+    req.port = port;
+    req.localAddress = localAddress;
+    req.localPort = localPort;
+
+    if (addressType === 4)
+      err = self._handle.connect(req, address, port);
+    else
+      err = self._handle.connect6(req, address, port);
+
+  } else {
+    const req = new PipeConnectWrap();
+    req.address = address;
+    req.oncomplete = afterConnect;
+    err = self._handle.connect(req, address, afterConnect);
+  }
+
+  if (err) {
+    var sockname = self._getsockname();
+    var details;
+
+    if (sockname) {
+      details = sockname.address + ':' + sockname.port;
+    }
+
+    const ex = exceptionWithHostPort(err, 'connect', address, port, details);
+    self._destroy(ex);
+  }
+}
+
+
+Socket.prototype.connect = function() {
+  const args = new Array(arguments.length);
+  for (var i = 0; i < arguments.length; i++)
+    args[i] = arguments[i];
+  // TODO(joyeecheung): use destructuring when V8 is fast enough
+  const normalized = normalizeArgs(args);
+  const options = normalized[0];
+  const cb = normalized[1];
+
+  if (this.write !== Socket.prototype.write)
+    this.write = Socket.prototype.write;
+
+  if (this.destroyed) {
+    this._readableState.reading = false;
+    this._readableState.ended = false;
+    this._readableState.endEmitted = false;
+    this._writableState.ended = false;
+    this._writableState.ending = false;
+    this._writableState.finished = false;
+    this._writableState.errorEmitted = false;
+    this.destroyed = false;
+    this._handle = null;
+    this._peername = null;
+    this._sockname = null;
+  }
+
+  var pipe = !!options.path;
+  debug('pipe', pipe, options.path);
+
+  if (!this._handle) {
+    this._handle = pipe ? new Pipe() : new TCP();
+    initSocketHandle(this);
+  }
+
+  if (cb !== null) {
+    this.once('connect', cb);
+  }
+
+  this._unrefTimer();
+
+  this.connecting = true;
+  this.writable = true;
+
+  if (pipe) {
+    connect(this, options.path);
+  } else {
+    lookupAndConnect(this, options);
+  }
+  return this;
+};
+
+
+function lookupAndConnect(self, options) {
+  const dns = require('dns');
+  var host = options.host || 'localhost';
+  var port = options.port;
+  var localAddress = options.localAddress;
+  var localPort = options.localPort;
+
+  if (localAddress && !exports.isIP(localAddress))
+    throw new TypeError('"localAddress" option must be a valid IP: ' +
+                        localAddress);
+
+  if (localPort && typeof localPort !== 'number')
+    throw new TypeError('"localPort" option should be a number: ' + localPort);
+
+  if (typeof port !== 'undefined') {
+    if (typeof port !== 'number' && typeof port !== 'string')
+      throw new TypeError('"port" option should be a number or string: ' +
+                          port);
+    if (!isLegalPort(port))
+      throw new RangeError('"port" option should be >= 0 and < 65536: ' + port);
+  }
+  port |= 0;
+
+  // If host is an IP, skip performing a lookup
+  var addressType = exports.isIP(host);
+  if (addressType) {
+    process.nextTick(function() {
+      if (self.connecting)
+        connect(self, host, port, addressType, localAddress, localPort);
+    });
+    return;
+  }
+
+  if (options.lookup && typeof options.lookup !== 'function')
+    throw new TypeError('"lookup" option should be a function');
+
+  var dnsopts = {
+    family: options.family,
+    hints: options.hints || 0
+  };
+
+  if (dnsopts.family !== 4 && dnsopts.family !== 6 && dnsopts.hints === 0) {
+    dnsopts.hints = dns.ADDRCONFIG;
+  }
+
+  debug('connect: find host ' + host);
+  debug('connect: dns options', dnsopts);
+  self._host = host;
+  var lookup = options.lookup || dns.lookup;
+  lookup(host, dnsopts, function emitLookup(err, ip, addressType) {
+    self.emit('lookup', err, ip, addressType, host);
+
+    // It's possible we were destroyed while looking this up.
+    // XXX it would be great if we could cancel the promise returned by
+    // the look up.
+    if (!self.connecting) return;
+
+    if (err) {
+      // net.createConnection() creates a net.Socket object and
+      // immediately calls net.Socket.connect() on it (that's us).
+      // There are no event listeners registered yet so defer the
+      // error event to the next tick.
+      err.host = options.host;
+      err.port = options.port;
+      err.message = err.message + ' ' + options.host + ':' + options.port;
+      process.nextTick(connectErrorNT, self, err);
+    } else {
+      self._unrefTimer();
+      connect(self,
+              ip,
+              port,
+              addressType,
+              localAddress,
+              localPort);
+    }
+  });
+}
+
+
+function connectErrorNT(self, err) {
+  self.emit('error', err);
+  self._destroy();
+}
+
+
+Socket.prototype.ref = function() {
+  if (!this._handle) {
+    this.once('connect', this.ref);
+    return this;
+  }
+
+  this._handle.ref();
+
+  return this;
+};
+
+
+Socket.prototype.unref = function() {
+  if (!this._handle) {
+    this.once('connect', this.unref);
+    return this;
+  }
+
+  this._handle.unref();
+
+  return this;
+};
+
+
+function afterConnect(status, handle, req, readable, writable) {
+  var self = handle.owner;
+
+  // callback may come after call to destroy
+  if (self.destroyed) {
+    return;
+  }
+
+  // Update handle if it was wrapped
+  // TODO(indutny): assert that the handle is actually an ancestor of old one
+  handle = self._handle;
+
+  debug('afterConnect');
+
+  assert.ok(self.connecting);
+  self.connecting = false;
+  self._sockname = null;
+
+  if (status === 0) {
+    self.readable = readable;
+    self.writable = writable;
+    self._unrefTimer();
+
+    self.emit('connect');
+
+    // start the first read, or get an immediate EOF.
+    // this doesn't actually consume any bytes, because len=0.
+    if (readable && !self.isPaused())
+      self.read(0);
+
+  } else {
+    self.connecting = false;
+    var details;
+    if (req.localAddress && req.localPort) {
+      details = req.localAddress + ':' + req.localPort;
+    }
+    var ex = exceptionWithHostPort(status,
+                                   'connect',
+                                   req.address,
+                                   req.port,
+                                   details);
+    if (details) {
+      ex.localAddress = req.localAddress;
+      ex.localPort = req.localPort;
+    }
+    self._destroy(ex);
+  }
+}
+
+
+function Server(options, connectionListener) {
+  if (!(this instanceof Server))
+    return new Server(options, connectionListener);
+
+  EventEmitter.call(this);
+
+  if (typeof options === 'function') {
+    connectionListener = options;
+    options = {};
+    this.on('connection', connectionListener);
+  } else if (options == null || typeof options === 'object') {
+    options = options || {};
+
+    if (typeof connectionListener === 'function') {
+      this.on('connection', connectionListener);
+    }
+  } else {
+    throw new TypeError('options must be an object');
+  }
+
+  this._connections = 0;
+
+  Object.defineProperty(this, 'connections', {
+    get: internalUtil.deprecate(() => {
+
+      if (this._usingSlaves) {
+        return null;
+      }
+      return this._connections;
+    }, 'Server.connections property is deprecated. ' +
+       'Use Server.getConnections method instead.', 'DEP0020'),
+    set: internalUtil.deprecate((val) => (this._connections = val),
+                                'Server.connections property is deprecated.',
+                                'DEP0020'),
+    configurable: true, enumerable: false
+  });
+
+  this._handle = null;
+  this._usingSlaves = false;
+  this._slaves = [];
+  this._unref = false;
+
+  this.allowHalfOpen = options.allowHalfOpen || false;
+  this.pauseOnConnect = !!options.pauseOnConnect;
+}
+util.inherits(Server, EventEmitter);
+exports.Server = Server;
+
+
+function toNumber(x) { return (x = Number(x)) >= 0 ? x : false; }
+
+function _listen(handle, backlog) {
+  // Use a backlog of 512 entries. We pass 511 to the listen() call because
+  // the kernel does: backlogsize = roundup_pow_of_two(backlogsize + 1);
+  // which will thus give us a backlog of 512 entries.
+  return handle.listen(backlog || 511);
+}
+
+function createServerHandle(address, port, addressType, fd) {
+  var err = 0;
+  // assign handle in listen, and clean up if bind or listen fails
+  var handle;
+
+  var isTCP = false;
+  if (typeof fd === 'number' && fd >= 0) {
+    try {
+      handle = createHandle(fd);
+    } catch (e) {
+      // Not a fd we can listen on.  This will trigger an error.
+      debug('listen invalid fd=' + fd + ': ' + e.message);
+      return uv.UV_EINVAL;
+    }
+    handle.open(fd);
+    handle.readable = true;
+    handle.writable = true;
+    assert(!address && !port);
+  } else if (port === -1 && addressType === -1) {
+    handle = new Pipe();
+    if (process.platform === 'win32') {
+      var instances = parseInt(process.env.NODE_PENDING_PIPE_INSTANCES);
+      if (!isNaN(instances)) {
+        handle.setPendingInstances(instances);
+      }
+    }
+  } else {
+    handle = new TCP();
+    isTCP = true;
+  }
+
+  if (address || port || isTCP) {
+    debug('bind to ' + (address || 'anycast'));
+    if (!address) {
+      // Try binding to ipv6 first
+      err = handle.bind6('::', port);
+      if (err) {
+        handle.close();
+        // Fallback to ipv4
+        return createServerHandle('0.0.0.0', port);
+      }
+    } else if (addressType === 6) {
+      err = handle.bind6(address, port);
+    } else {
+      err = handle.bind(address, port);
+    }
+  }
+
+  if (err) {
+    handle.close();
+    return err;
+  }
+
+  return handle;
+}
+exports._createServerHandle = createServerHandle;
+
+//27.onconnection在_listen2方法中被执行。下面看看_listen2 
+Server.prototype._listen2 = function(address, port, addressType, backlog, fd) {
+  debug('listen2', address, port, addressType, backlog, fd);
+
+  // If there is not yet a handle, we need to create one and bind.
+  // In the case of a server sent via IPC, we don't need to do this.
+  if (this._handle) {
+    debug('_listen2: have a handle already');
+  } else {
+    debug('_listen2: create a handle');
+
+    var rval = null;
+
+    if (!address && typeof fd !== 'number') {
+      rval = createServerHandle('::', port, 6, fd);
+
+      if (typeof rval === 'number') {
+        rval = null;
+        address = '0.0.0.0';
+        addressType = 4;
+      } else {
+        address = '::';
+        addressType = 6;
+      }
+    }
+
+    if (rval === null)
+      rval = createServerHandle(address, port, addressType, fd);
+
+    if (typeof rval === 'number') {
+      var error = exceptionWithHostPort(rval, 'listen', address, port);
+      process.nextTick(emitErrorNT, this, error);
+      return;
+    }
+    this._handle = rval;
+  }
+
+  this._handle.onconnection = onconnection;//26.onconnection赋给this._handle.onconnection
+  this._handle.owner = this;
+
+  var err = _listen(this._handle, backlog);
+
+  if (err) {
+    var ex = exceptionWithHostPort(err, 'listen', address, port);
+    this._handle.close();
+    this._handle = null;
+    process.nextTick(emitErrorNT, this, ex);
+    return;
+  }
+
+  // generate connection key, this should be unique to the connection
+  this._connectionKey = addressType + ':' + address + ':' + port;
+
+  // unref the handle if the server was unref'ed prior to listening
+  if (this._unref)
+    this.unref();
+
+  process.nextTick(emitListeningNT, this);
+};
+
+
+function emitErrorNT(self, err) {
+  self.emit('error', err);
+}
+
+
+function emitListeningNT(self) {
+  // ensure handle hasn't closed
+  if (self._handle)
+    self.emit('listening');
+}
+
+
+function listen(self, address, port, addressType, backlog, fd, exclusive) {
+  exclusive = !!exclusive;
+
+  if (!cluster) cluster = require('cluster');
+
+  if (cluster.isMaster || exclusive) {
+    self._listen2(address, port, addressType, backlog, fd);//28._listen2 在function listen中被调用。那么function listen呢
+    return;
+  }
+
+  cluster._getServer(self, {
+    address: address,
+    port: port,
+    addressType: addressType,
+    fd: fd,
+    flags: 0
+  }, cb);
+
+  function cb(err, handle) {
+    // EADDRINUSE may not be reported until we call listen(). To complicate
+    // matters, a failed bind() followed by listen() will implicitly bind to
+    // a random port. Ergo, check that the socket is bound to the expected
+    // port before calling listen().
+    //
+    // FIXME(bnoordhuis) Doesn't work for pipe handles, they don't have a
+    // getsockname() method. Non-issue for now, the cluster module doesn't
+    // really support pipes anyway.
+    if (err === 0 && port > 0 && handle.getsockname) {
+      var out = {};
+      err = handle.getsockname(out);
+      if (err === 0 && port !== out.port)
+        err = uv.UV_EADDRINUSE;
+    }
+
+    if (err) {
+      var ex = exceptionWithHostPort(err, 'bind', address, port);
+      return self.emit('error', ex);
+    }
+
+    self._handle = handle;
+    self._listen2(address, port, addressType, backlog, fd);
+  }
+}
+
+//29.在Server原型上有listen方法。到此net.js小段落，_httpServer是继承net.js的，所以在我们自己写的http.js中createServer拿到的实例是有listen的，所以在listen(2015)的时候会调用在net.js中的listen函数，在listen函数中又会调用_listen2,在_listen2被调用的时候的会把onconnection方法赋给self.handle.onconnection
+Server.prototype.listen = function() {
+  const args = new Array(arguments.length);
+  for (var i = 0; i < arguments.length; i++)
+    args[i] = arguments[i];
+  // TODO(joyeecheung): use destructuring when V8 is fast enough
+  const normalized = normalizeArgs(args);
+  var options = normalized[0];
+  const cb = normalized[1];
+
+  var hasCallback = (cb !== null);
+  if (hasCallback) {
+    this.once('listening', cb);
+  }
+  const backlogFromArgs =
+    // (handle, backlog) or (path, backlog) or (port, backlog)
+    toNumber(args.length > 1 && args[1]) ||
+    toNumber(args.length > 2 && args[2]);  // (port, host, backlog)
+
+  options = options._handle || options.handle || options;
+  // (handle[, backlog][, cb]) where handle is an object with a handle
+  if (options instanceof TCP) {
+    this._handle = options;
+    listen(this, null, -1, -1, backlogFromArgs);
+    return this;
+  }
+  // (handle[, backlog][, cb]) where handle is an object with a fd
+  if (typeof options.fd === 'number' && options.fd >= 0) {
+    listen(this, null, null, null, backlogFromArgs, options.fd);
+    return this;
+  }
+
+  // ([port][, host][, backlog][, cb]) where port is omitted,
+  // that is, listen() or listen(cb),
+  // or (options[, cb]) where options.port is explicitly set as undefined,
+  // bind to an arbitrary unused port
+  if (args.length === 0 || typeof args[0] === 'function' ||
+    (typeof options.port === 'undefined' && 'port' in options)) {
+    options.port = 0;
+  }
+  // ([port][, host][, backlog][, cb]) where port is specified
+  // or (options[, cb]) where options.port is specified
+  // or if options.port is normalized as 0 before
+  if (typeof options.port === 'number' || typeof options.port === 'string') {
+    if (!isLegalPort(options.port)) {
+      throw new RangeError('"port" argument must be >= 0 and < 65536');
+    }
+    const backlog = options.backlog || backlogFromArgs;
+    // start TCP server listening on host:port
+    if (options.host) {
+      lookupAndListen(this, options.port | 0, options.host, backlog,
+                      options.exclusive);
+    } else { // Undefined host, listens on unspecified address
+      listen(this, null, options.port | 0, 4, // addressType will be ignored
+             backlog, undefined, options.exclusive);
+    }
+    return this;
+  }
+
+  // (path[, backlog][, cb]) or (options[, cb])
+  // where path or options.path is a UNIX domain socket or Windows pipe
+  if (options.path && isPipeName(options.path)) {
+    const pipeName = this._pipeName = options.path;
+    const backlog = options.backlog || backlogFromArgs;
+    listen(this, pipeName, -1, -1, backlog, undefined, options.exclusive);
+    return this;
+  }
+
+  throw new Error('Invalid listen argument: ' + util.inspect(options));
+};
+
+function lookupAndListen(self, port, address, backlog, exclusive) {
+  require('dns').lookup(address, function doListening(err, ip, addressType) {
+    if (err) {
+      self.emit('error', err);
+    } else {
+      addressType = ip ? addressType : 4;
+      listen(self, ip, port, addressType, backlog, undefined, exclusive);
+    }
+  });
+}
+
+Object.defineProperty(Server.prototype, 'listening', {
+  get: function() {
+    return !!this._handle;
+  },
+  configurable: true,
+  enumerable: true
+});
+
+Server.prototype.address = function() {
+  if (this._handle && this._handle.getsockname) {
+    var out = {};
+    this._handle.getsockname(out);
+    // TODO(bnoordhuis) Check err and throw?
+    return out;
+  } else if (this._pipeName) {
+    return this._pipeName;
+  } else {
+    return null;
+  }
+};
+
+function onconnection(err, clientHandle) {
+  var handle = this;
+  var self = handle.owner;
+
+  debug('onconnection');//25.self.connection是在onconnection中被触发的
+
+  if (err) {
+    self.emit('error', errnoException(err, 'accept'));
+    return;
+  }
+
+  if (self.maxConnections && self._connections >= self.maxConnections) {
+    clientHandle.close();
+    return;
+  }
+
+  var socket = new Socket({
+    handle: clientHandle,
+    allowHalfOpen: self.allowHalfOpen,
+    pauseOnCreate: self.pauseOnConnect
+  });
+  socket.readable = socket.writable = true;
+
+
+  self._connections++;
+  socket.server = self;
+  socket._server = self;
+
+  DTRACE_NET_SERVER_CONNECTION(socket);
+  LTTNG_NET_SERVER_CONNECTION(socket);
+  COUNTER_NET_SERVER_CONNECTION(socket);
+  self.emit('connection', socket);//24.connection事件
+}
+
+
+Server.prototype.getConnections = function(cb) {
+  function end(err, connections) {
+    process.nextTick(cb, err, connections);
+  }
+
+  if (!this._usingSlaves) {
+    return end(null, this._connections);
+  }
+
+  // Poll slaves
+  var left = this._slaves.length;
+  var total = this._connections;
+
+  function oncount(err, count) {
+    if (err) {
+      left = -1;
+      return end(err);
+    }
+
+    total += count;
+    if (--left === 0) return end(null, total);
+  }
+
+  for (var n = 0; n < this._slaves.length; n++) {
+    this._slaves[n].getConnections(oncount);
+  }
+};
+
+
+Server.prototype.close = function(cb) {
+  function onSlaveClose() {
+    if (--left !== 0) return;
+
+    self._connections = 0;
+    self._emitCloseIfDrained();
+  }
+
+  if (typeof cb === 'function') {
+    if (!this._handle) {
+      this.once('close', function close() {
+        cb(new Error('Not running'));
+      });
+    } else {
+      this.once('close', cb);
+    }
+  }
+
+  if (this._handle) {
+    this._handle.close();
+    this._handle = null;
+  }
+
+  if (this._usingSlaves) {
+    var self = this;
+    var left = this._slaves.length;
+
+    // Increment connections to be sure that, even if all sockets will be closed
+    // during polling of slaves, `close` event will be emitted only once.
+    this._connections++;
+
+    // Poll slaves
+    for (var n = 0; n < this._slaves.length; n++)
+      this._slaves[n].close(onSlaveClose);
+  } else {
+    this._emitCloseIfDrained();
+  }
+
+  return this;
+};
+
+Server.prototype._emitCloseIfDrained = function() {
+  debug('SERVER _emitCloseIfDrained');
+
+  if (this._handle || this._connections) {
+    debug('SERVER handle? %j   connections? %d',
+          !!this._handle, this._connections);
+    return;
+  }
+
+  process.nextTick(emitCloseNT, this);
+};
+
+
+function emitCloseNT(self) {
+  debug('SERVER: emit close');
+  self.emit('close');
+}
+
+
+Server.prototype.listenFD = internalUtil.deprecate(function(fd, type) {
+  return this.listen({ fd: fd });
+}, 'Server.listenFD is deprecated. Use Server.listen({fd: <number>}) instead.',
+                                                   'DEP0021');
+
+Server.prototype._setupSlave = function(socketList) {
+  this._usingSlaves = true;
+  this._slaves.push(socketList);
+};
+
+Server.prototype.ref = function() {
+  this._unref = false;
+
+  if (this._handle)
+    this._handle.ref();
+
+  return this;
+};
+
+Server.prototype.unref = function() {
+  this._unref = true;
+
+  if (this._handle)
+    this._handle.unref();
+
+  return this;
+};
+
+
+exports.isIP = cares.isIP;
+
+
+exports.isIPv4 = cares.isIPv4;
+
+
+exports.isIPv6 = cares.isIPv6;
+
+
+if (process.platform === 'win32') {
+  var simultaneousAccepts;
+
+  exports._setSimultaneousAccepts = function(handle) {
+    if (handle === undefined) {
+      return;
+    }
+
+    if (simultaneousAccepts === undefined) {
+      simultaneousAccepts = (process.env.NODE_MANY_ACCEPTS &&
+                             process.env.NODE_MANY_ACCEPTS !== '0');
+    }
+
+    if (handle._simultaneousAccepts !== simultaneousAccepts) {
+      handle.setSimultaneousAccepts(simultaneousAccepts);
+      handle._simultaneousAccepts = simultaneousAccepts;
+    }
+  };
+} else {
+  exports._setSimultaneousAccepts = function(handle) {};
+}
+
+
+
+
+
+
+
